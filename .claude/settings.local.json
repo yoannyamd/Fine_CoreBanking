@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker pull *)",
+      "Bash(py -3.13 -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(py -3.10 -m pip show poetry)",
+      "Bash(py -3.13 -m pip show poetry)",
+      "PowerShell(Get-Command poetry -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source; \\(py -3.10 -c \"import site; print\\(site.getusersitepackages\\(\\)\\)\"\\); \\(py -3.13 -c \"import site; print\\(site.getusersitepackages\\(\\)\\)\"\\))",
+      "PowerShell(py -3.10 -m poetry --version 2>&1)",
+      "PowerShell(py -3.13 -m pip install pipx 2>&1)",
+      "PowerShell(Select-String -Pattern \"Successfully|already|error\" -CaseSensitive:$false)",
+      "PowerShell(py -3.13 -m pipx install poetry 2>&1)",
+      "PowerShell(py -3.13 -m pip install poetry 2>&1)",
+      "PowerShell(py -3.13 -m pip show poetry 2>&1)"
+    ]
+  }
+}

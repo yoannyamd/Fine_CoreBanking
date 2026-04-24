@@ -68,7 +68,7 @@ def upgrade() -> None:
         sa.Column("short_name", sa.String(50), nullable=True),
         sa.Column(
             "account_class",
-            sa.Enum("1","2","3","4","5","6","7","8","9", name="accountclass"),
+            sa.Enum("CAPITAL","IMMOBILISE","STOCK","TIERS","TRESORERIE","CHARGES","PRODUITS","SPECIAUX","ANALYTIQUE", name="accountclass"),
             nullable=False,
         ),
         sa.Column(
