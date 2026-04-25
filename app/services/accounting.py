@@ -12,10 +12,11 @@ import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import (
-    AccountHasChildrenError, AccountNotActiveError,
+    AccountAlreadyExistsError, AccountHasChildrenError, AccountNotActiveError,
     FiscalYearClosedError, JournalEntryAlreadyPostedError,
     JournalEntryAlreadyReversedError, JournalEntryImbalancedError,
     JournalEntryMinimumLinesError, LetteringImbalancedError,
@@ -106,10 +107,8 @@ class AccountService:
         self.repo = AccountRepository(session)
 
     async def create(self, data: AccountCreate) -> AccountPlan:
-        # Vérifier unicité du code
         existing = await self.repo.get_by_code(data.code)
         if existing:
-            from app.core.exceptions import AccountAlreadyExistsError
             raise AccountAlreadyExistsError(f"Le compte {data.code} existe déjà.")
 
         level = 1
@@ -242,9 +241,20 @@ class JournalEntryService:
         )
         entry = await self.entry_repo.create(entry)
 
+        # Batch-fetch de tous les comptes pour éviter le N+1
+        account_ids = [line_data.account_id for line_data in data.lines]
+        stmt = select(AccountPlan).where(AccountPlan.id.in_(account_ids))
+        accounts_by_id = {
+            a.id: a
+            for a in (await self.session.execute(stmt)).scalars().all()
+        }
+
         # Créer les lignes
         for i, line_data in enumerate(data.lines, start=1):
-            account = await self.account_repo.get_by_id(line_data.account_id)
+            account = accounts_by_id.get(line_data.account_id)
+            if not account:
+                from app.core.exceptions import AccountNotFoundError
+                raise AccountNotFoundError(f"Compte {line_data.account_id} introuvable.")
             if not account.is_active:
                 raise AccountNotActiveError(f"Le compte {account.code} est inactif.")
 
@@ -311,8 +321,8 @@ class JournalEntryService:
         original = await self.entry_repo.get_by_id(entry_id, with_lines=True)
 
         if original.status != EntryStatus.POSTED:
-            raise JournalEntryAlreadyPostedError(
-                "Seules les écritures validées peuvent être extournées."
+            raise JournalEntryAlreadyReversedError(
+                "Seules les écritures validées (POSTED) peuvent être extournées."
             )
 
         # Vérifier que l'écriture n'a pas déjà été extournée
@@ -322,7 +332,7 @@ class JournalEntryService:
                 f"L'écriture {original.entry_number} a déjà été extournée."
             )
 
-        reversal_date = reversal_date or date.today()
+        reversal_date = reversal_date or datetime.now(timezone.utc).date()
 
         # Chercher le journal d'extourne (EX)
         ex_journal = await self.journal_repo.get_by_code(JournalCode.EX.value)
@@ -378,7 +388,6 @@ class JournalEntryService:
         return reversal
 
     async def _find_reversals(self, entry_id: str) -> list[JournalEntry]:
-        from sqlalchemy import select
         stmt = select(JournalEntry).where(JournalEntry.source_entry_id == entry_id)
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
@@ -390,7 +399,6 @@ class JournalEntryService:
         Lettrage de lignes comptables (ex: rapprocher une facture et son paiement).
         Le lettrage doit être équilibré (Σdébit = Σcrédit).
         """
-        from sqlalchemy import select
         stmt = select(JournalLine).where(JournalLine.id.in_(line_ids))
         result = await self.session.execute(stmt)
         lines = list(result.scalars().all())

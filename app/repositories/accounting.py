@@ -6,13 +6,13 @@ from datetime import date
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.exceptions import (
     AccountNotFoundError, FiscalYearNotFoundError,
-    JournalEntryNotFoundError, PeriodNotFoundError,
+    JournalEntryNotFoundError, PeriodNotFoundError, AccountingBaseError,
 )
 from app.models.accounting import (
     AccountPlan, AccountingPeriod, EntryStatus, FiscalYear,
@@ -133,7 +133,6 @@ class AccountRepository:
             )
 
         if filters:
-            from sqlalchemy import and_
             stmt = stmt.where(and_(*filters))
             count_stmt = count_stmt.where(and_(*filters))
 
@@ -187,7 +186,7 @@ class JournalRepository:
     async def get_by_id(self, id: str) -> Journal:
         result = await self.session.get(Journal, id)
         if not result:
-            raise JournalEntryNotFoundError(f"Journal {id} introuvable.")
+            raise AccountingBaseError(f"Journal {id} introuvable.")
         return result
 
     async def get_by_code(self, code: str) -> Journal | None:
@@ -298,7 +297,6 @@ class JournalEntryRepository:
                      ap.account_type, ap.account_nature, ap.currency
             ORDER BY ap.code
         """
-        from sqlalchemy import text
         rows = (
             await self.session.execute(
                 text(stmt), {"start_date": start_date, "end_date": end_date}
@@ -326,7 +324,6 @@ class JournalEntryRepository:
               AND je.entry_date BETWEEN :start_date AND :end_date
             ORDER BY je.entry_date, je.entry_number, jl.line_number
         """
-        from sqlalchemy import text
         rows = (
             await self.session.execute(
                 text(stmt),
