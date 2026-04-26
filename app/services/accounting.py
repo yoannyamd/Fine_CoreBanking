@@ -12,7 +12,6 @@ import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import (
@@ -96,6 +95,9 @@ class FiscalYearService:
         fy.status = FiscalYearStatus.CLOSED
         fy.closed_at = utcnow()
         fy.closed_by = closed_by
+
+        from app.services.kafka_producer import publish_fiscal_year_closed
+        await publish_fiscal_year_closed(fiscal_year_id=fy.id, fiscal_year_name=fy.name)
         return fy
 
     async def list_all(self) -> list[FiscalYear]:
@@ -145,11 +147,17 @@ class AccountService:
         return await self.repo.update(account, updates)
 
     async def deactivate(self, account_id: str) -> AccountPlan:
+        from datetime import date as date_cls
         account = await self.repo.get_by_id(account_id)
         children = await self.repo.get_children(account_id)
         if children:
             raise AccountHasChildrenError(
                 f"Impossible de désactiver le compte {account.code} : il a des sous-comptes."
+            )
+        balances = await self.repo.get_balance(account_id, date_cls(2000, 1, 1), date_cls.today())
+        if balances["total_debit"] != 0 or balances["total_credit"] != 0:
+            raise AccountHasBalanceError(
+                f"Impossible de désactiver le compte {account.code} : solde non nul."
             )
         return await self.repo.update(account, {"is_active": False})
 
@@ -216,6 +224,13 @@ class JournalEntryService:
                 f"Aucune période ouverte trouvée pour la date {data.entry_date}."
             )
 
+        # Vérifier que l'exercice fiscal est aussi ouvert
+        fiscal_year = await self.session.get(FiscalYear, period.fiscal_year_id)
+        if fiscal_year and fiscal_year.status != FiscalYearStatus.OPEN:
+            raise FiscalYearClosedError(
+                f"L'exercice {fiscal_year.name} est clôturé. Aucune écriture possible."
+            )
+
         # Générer le numéro d'écriture séquentiel
         seq = await self.journal_repo.next_sequence(journal.id)
         entry_number = f"{journal.sequence_prefix}{journal.code}-{data.entry_date.year}-{seq:06d}"
@@ -243,11 +258,7 @@ class JournalEntryService:
 
         # Batch-fetch de tous les comptes pour éviter le N+1
         account_ids = [line_data.account_id for line_data in data.lines]
-        stmt = select(AccountPlan).where(AccountPlan.id.in_(account_ids))
-        accounts_by_id = {
-            a.id: a
-            for a in (await self.session.execute(stmt)).scalars().all()
-        }
+        accounts_by_id = await self.account_repo.get_by_ids(account_ids)
 
         # Créer les lignes
         for i, line_data in enumerate(data.lines, start=1):
@@ -294,9 +305,7 @@ class JournalEntryService:
         total_debit = sum(l.debit_amount for l in entry.lines)
         total_credit = sum(l.credit_amount for l in entry.lines)
         if total_debit != total_credit:
-            raise JournalEntryImbalancedError(
-                float(total_debit), float(total_credit)
-            )
+            raise JournalEntryImbalancedError(total_debit, total_credit)
 
         # Revérifier la période
         period = await self.period_repo.get_by_id(entry.period_id)
@@ -309,6 +318,16 @@ class JournalEntryService:
         entry.posted_by = posted_by
         entry.posting_date = utcnow()
         await self.session.flush()
+        await self.session.refresh(entry)
+
+        from app.services.kafka_producer import publish_entry_posted
+        await publish_entry_posted(
+            entry_id=entry.id,
+            entry_number=entry.entry_number,
+            entry_date=str(entry.entry_date),
+            total_debit=str(entry.total_debit),
+            total_credit=str(entry.total_credit),
+        )
         return entry
 
     async def reverse_entry(

@@ -235,8 +235,13 @@ async def process_event(event: AccountingEvent, session: AsyncSession) -> None:
     for code, sens, amount in movements:
         account = await account_repo.get_by_code(code)
         if not account:
-            logger.error("Compte %s introuvable — événement %s ignoré", code, event.event_id)
-            return
+            raise ValueError(
+                f"Compte {code} introuvable dans le plan — événement {event.event_id} rejeté."
+            )
+        if not account.is_active:
+            raise ValueError(
+                f"Compte {code} inactif — événement {event.event_id} rejeté."
+            )
 
         lines.append(
             JournalLineCreate(
@@ -317,7 +322,7 @@ async def run_consumer() -> None:
                         "Kafka source mismatch — topic=%s déclaré=%s attendu=%s — message rejeté",
                         topic, declared_source, expected_source,
                     )
-                    await consumer.commit()
+                    # Ne pas commiter : message potentiellement forgé, laisser en queue
                     continue
 
                 event = AccountingEvent(
