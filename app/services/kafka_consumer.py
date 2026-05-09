@@ -23,10 +23,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.db.session import AsyncSessionFactory
+from app.repositories.accounting import AccountRepository, JournalRepository
 from app.schemas.accounting import JournalEntryCreate, JournalLineCreate
 from app.services.accounting import JournalEntryService
 
 logger = logging.getLogger(__name__)
+
+# Mapping strict topic → service autorisé.
+# Un message sur credit.events provenant d'un autre service est rejeté.
+TOPIC_ALLOWED_SOURCES: dict[str, str] = {
+    settings.KAFKA_TOPIC_CREDIT_EVENTS:  "credit-service",
+    settings.KAFKA_TOPIC_SAVINGS_EVENTS: "savings-service",
+    settings.KAFKA_TOPIC_CASH_EVENTS:    "cash-service",
+}
 
 
 class EventType(str, Enum):
@@ -220,16 +229,19 @@ async def process_event(event: AccountingEvent, session: AsyncSession) -> None:
         logger.warning("Événement ignoré — règle manquante: %s", e)
         return
 
-    # Résoudre les codes de comptes en IDs
-    from app.repositories.accounting import AccountRepository
     account_repo = AccountRepository(session)
     lines = []
 
     for code, sens, amount in movements:
         account = await account_repo.get_by_code(code)
         if not account:
-            logger.error("Compte %s introuvable — événement %s ignoré", code, event.event_id)
-            return
+            raise ValueError(
+                f"Compte {code} introuvable dans le plan — événement {event.event_id} rejeté."
+            )
+        if not account.is_active:
+            raise ValueError(
+                f"Compte {code} inactif — événement {event.event_id} rejeté."
+            )
 
         lines.append(
             JournalLineCreate(
@@ -250,7 +262,6 @@ async def process_event(event: AccountingEvent, session: AsyncSession) -> None:
     }
     journal_code = journal_map.get(event.source_service, "OD")
 
-    from app.repositories.accounting import JournalRepository
     journal_repo = JournalRepository(session)
     journal = await journal_repo.get_by_code(journal_code)
 
@@ -300,10 +311,24 @@ async def run_consumer() -> None:
         async for msg in consumer:
             raw = msg.value
             try:
+                # Zero Trust : vérifier que la source déclarée correspond au topic.
+                # Le champ source_service du payload ne suffit pas —
+                # on le confirme via le topic de provenance.
+                topic = msg.topic
+                declared_source = raw.get("source_service", "")
+                expected_source = TOPIC_ALLOWED_SOURCES.get(topic, "")
+                if declared_source != expected_source:
+                    logger.warning(
+                        "Kafka source mismatch — topic=%s déclaré=%s attendu=%s — message rejeté",
+                        topic, declared_source, expected_source,
+                    )
+                    # Ne pas commiter : message potentiellement forgé, laisser en queue
+                    continue
+
                 event = AccountingEvent(
                     event_id=raw["event_id"],
                     event_type=EventType(raw["event_type"]),
-                    source_service=raw["source_service"],
+                    source_service=expected_source,   # source fiable (topic), pas le payload
                     occurred_at=raw["occurred_at"],
                     payload=raw.get("payload", {}),
                 )

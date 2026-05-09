@@ -10,14 +10,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Poetry
 RUN pip install poetry==1.8.2
 ENV POETRY_NO_INTERACTION=1 \
-    POETRY_VENV_IN_PROJECT=1 \
+    POETRY_VIRTUALENVS_IN_PROJECT=true \
     POETRY_CACHE_DIR=/tmp/poetry_cache
 
 COPY pyproject.toml poetry.lock* ./
 RUN poetry install --no-root --only main && rm -rf $POETRY_CACHE_DIR
 
 COPY . .
-RUN poetry install --only main
 
 ENV PATH="/app/.venv/bin:$PATH"
 ENV PYTHONPATH="/app"

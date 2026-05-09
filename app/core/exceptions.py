@@ -52,10 +52,10 @@ class JournalEntryImbalancedError(AccountingBaseError):
     status_code = 422
     error_code = "JOURNAL_ENTRY_IMBALANCED"
 
-    def __init__(self, total_debit: float, total_credit: float):
+    def __init__(self, total_debit, total_credit):
         super().__init__(
             f"Écriture déséquilibrée: Débit={total_debit} ≠ Crédit={total_credit}",
-            details={"total_debit": total_debit, "total_credit": total_credit}
+            details={"total_debit": str(total_debit), "total_credit": str(total_credit)}
         )
 
 

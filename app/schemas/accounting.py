@@ -3,7 +3,7 @@ Schémas Pydantic v2 — Validation des entrées/sorties API.
 """
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Annotated
+from typing import Annotated, Generic, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -28,8 +28,11 @@ class PaginationParams(BaseModel):
         return (self.page - 1) * self.size
 
 
-class PaginatedResponse[T](BaseModel):
-    items: list[T]
+_T = TypeVar("_T")
+
+
+class PaginatedResponse(BaseModel, Generic[_T]):
+    items: list[_T]
     total: int
     page: int
     size: int

@@ -15,7 +15,7 @@ from decimal import Decimal
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import (
-    AccountHasChildrenError, AccountNotActiveError,
+    AccountAlreadyExistsError, AccountHasChildrenError, AccountNotActiveError,
     FiscalYearClosedError, JournalEntryAlreadyPostedError,
     JournalEntryAlreadyReversedError, JournalEntryImbalancedError,
     JournalEntryMinimumLinesError, LetteringImbalancedError,
@@ -95,6 +95,9 @@ class FiscalYearService:
         fy.status = FiscalYearStatus.CLOSED
         fy.closed_at = utcnow()
         fy.closed_by = closed_by
+
+        from app.services.kafka_producer import publish_fiscal_year_closed
+        await publish_fiscal_year_closed(fiscal_year_id=fy.id, fiscal_year_name=fy.name)
         return fy
 
     async def list_all(self) -> list[FiscalYear]:
@@ -106,10 +109,8 @@ class AccountService:
         self.repo = AccountRepository(session)
 
     async def create(self, data: AccountCreate) -> AccountPlan:
-        # Vérifier unicité du code
         existing = await self.repo.get_by_code(data.code)
         if existing:
-            from app.core.exceptions import AccountAlreadyExistsError
             raise AccountAlreadyExistsError(f"Le compte {data.code} existe déjà.")
 
         level = 1
@@ -146,11 +147,17 @@ class AccountService:
         return await self.repo.update(account, updates)
 
     async def deactivate(self, account_id: str) -> AccountPlan:
+        from datetime import date as date_cls
         account = await self.repo.get_by_id(account_id)
         children = await self.repo.get_children(account_id)
         if children:
             raise AccountHasChildrenError(
                 f"Impossible de désactiver le compte {account.code} : il a des sous-comptes."
+            )
+        balances = await self.repo.get_balance(account_id, date_cls(2000, 1, 1), date_cls.today())
+        if balances["total_debit"] != 0 or balances["total_credit"] != 0:
+            raise AccountHasBalanceError(
+                f"Impossible de désactiver le compte {account.code} : solde non nul."
             )
         return await self.repo.update(account, {"is_active": False})
 
@@ -217,6 +224,13 @@ class JournalEntryService:
                 f"Aucune période ouverte trouvée pour la date {data.entry_date}."
             )
 
+        # Vérifier que l'exercice fiscal est aussi ouvert
+        fiscal_year = await self.session.get(FiscalYear, period.fiscal_year_id)
+        if fiscal_year and fiscal_year.status != FiscalYearStatus.OPEN:
+            raise FiscalYearClosedError(
+                f"L'exercice {fiscal_year.name} est clôturé. Aucune écriture possible."
+            )
+
         # Générer le numéro d'écriture séquentiel
         seq = await self.journal_repo.next_sequence(journal.id)
         entry_number = f"{journal.sequence_prefix}{journal.code}-{data.entry_date.year}-{seq:06d}"
@@ -242,9 +256,16 @@ class JournalEntryService:
         )
         entry = await self.entry_repo.create(entry)
 
+        # Batch-fetch de tous les comptes pour éviter le N+1
+        account_ids = [line_data.account_id for line_data in data.lines]
+        accounts_by_id = await self.account_repo.get_by_ids(account_ids)
+
         # Créer les lignes
         for i, line_data in enumerate(data.lines, start=1):
-            account = await self.account_repo.get_by_id(line_data.account_id)
+            account = accounts_by_id.get(line_data.account_id)
+            if not account:
+                from app.core.exceptions import AccountNotFoundError
+                raise AccountNotFoundError(f"Compte {line_data.account_id} introuvable.")
             if not account.is_active:
                 raise AccountNotActiveError(f"Le compte {account.code} est inactif.")
 
@@ -284,9 +305,7 @@ class JournalEntryService:
         total_debit = sum(l.debit_amount for l in entry.lines)
         total_credit = sum(l.credit_amount for l in entry.lines)
         if total_debit != total_credit:
-            raise JournalEntryImbalancedError(
-                float(total_debit), float(total_credit)
-            )
+            raise JournalEntryImbalancedError(total_debit, total_credit)
 
         # Revérifier la période
         period = await self.period_repo.get_by_id(entry.period_id)
@@ -299,6 +318,16 @@ class JournalEntryService:
         entry.posted_by = posted_by
         entry.posting_date = utcnow()
         await self.session.flush()
+        await self.session.refresh(entry)
+
+        from app.services.kafka_producer import publish_entry_posted
+        await publish_entry_posted(
+            entry_id=entry.id,
+            entry_number=entry.entry_number,
+            entry_date=str(entry.entry_date),
+            total_debit=str(entry.total_debit),
+            total_credit=str(entry.total_credit),
+        )
         return entry
 
     async def reverse_entry(
@@ -311,8 +340,8 @@ class JournalEntryService:
         original = await self.entry_repo.get_by_id(entry_id, with_lines=True)
 
         if original.status != EntryStatus.POSTED:
-            raise JournalEntryAlreadyPostedError(
-                "Seules les écritures validées peuvent être extournées."
+            raise JournalEntryAlreadyReversedError(
+                "Seules les écritures validées (POSTED) peuvent être extournées."
             )
 
         # Vérifier que l'écriture n'a pas déjà été extournée
@@ -322,7 +351,7 @@ class JournalEntryService:
                 f"L'écriture {original.entry_number} a déjà été extournée."
             )
 
-        reversal_date = reversal_date or date.today()
+        reversal_date = reversal_date or datetime.now(timezone.utc).date()
 
         # Chercher le journal d'extourne (EX)
         ex_journal = await self.journal_repo.get_by_code(JournalCode.EX.value)
@@ -378,7 +407,6 @@ class JournalEntryService:
         return reversal
 
     async def _find_reversals(self, entry_id: str) -> list[JournalEntry]:
-        from sqlalchemy import select
         stmt = select(JournalEntry).where(JournalEntry.source_entry_id == entry_id)
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
@@ -390,7 +418,6 @@ class JournalEntryService:
         Lettrage de lignes comptables (ex: rapprocher une facture et son paiement).
         Le lettrage doit être équilibré (Σdébit = Σcrédit).
         """
-        from sqlalchemy import select
         stmt = select(JournalLine).where(JournalLine.id.in_(line_ids))
         result = await self.session.execute(stmt)
         lines = list(result.scalars().all())

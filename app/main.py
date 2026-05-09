@@ -10,11 +10,12 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.v1 import accounts, journals, reports
+from app.api.v1 import accounts, auth, journals, reports, users
 from app.core.config import settings
 from app.core.exceptions import AccountingBaseError
-from app.db.session import engine
+from app.db.session import AsyncSessionFactory, engine
 from app.models.accounting import Base
+from app.models.auth import User  # noqa: F401 — registers User table with Base.metadata
 
 # ─── Logging structuré ────────────────────────────────────────────────────────
 
@@ -35,12 +36,18 @@ async def lifespan(app: FastAPI):
     logger.info("accounting_service.starting", version=settings.APP_VERSION)
 
     # Créer les tables (en dev — utiliser Alembic en prod)
-    if settings.ENVIRONMENT == "development":
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    # Seed admin par défaut
+    from app.services.auth import seed_admin
+    async with AsyncSessionFactory() as session:
+        async with session.begin():
+            await seed_admin(session)
 
     # Démarrer le consommateur Kafka en arrière-plan
     from app.services.kafka_consumer import run_consumer
+    from app.services.kafka_producer import stop_producer
     kafka_task = asyncio.create_task(run_consumer())
 
     yield
@@ -51,6 +58,7 @@ async def lifespan(app: FastAPI):
         await kafka_task
     except asyncio.CancelledError:
         pass
+    await stop_producer()
     await engine.dispose()
     logger.info("accounting_service.stopped")
 
@@ -115,6 +123,8 @@ async def generic_error_handler(request: Request, exc: Exception):
 
 API_PREFIX = "/api/v1"
 
+app.include_router(auth.router, prefix=API_PREFIX)
+app.include_router(users.router, prefix=API_PREFIX)
 app.include_router(accounts.router, prefix=API_PREFIX)
 app.include_router(journals.router, prefix=API_PREFIX)
 app.include_router(reports.router, prefix=API_PREFIX)
